@@ -48,7 +48,8 @@ __managed__ int c_cpu[M*K];
 
 __global__ void gpu_matrix(int* a, int* b, int* c, int m, int n, int k)
 {
-    // 每个block内共享shared_memory内存，因此可以理解成是对一个block编程
+    // 并行计算的编程思想是对每个线程编程，每个线程并行执行，替代for循环
+    // 每个block内共享shared_memory内存
     __shared__ int sub_a[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ int sub_b[BLOCK_SIZE][BLOCK_SIZE];
     int x = blockIdx.x * blockDim.x + threadIdx.x;
