@@ -2,7 +2,10 @@
 #include <math.h>
 #include <cuda_runtime.h>
 
-// 利用shared memory优化矩阵乘 
+// 利用shared memory优化矩阵乘，减少对global_memory的访存次数
+// 性能瓶颈：计算访存比并未得到明显改善；MIO访存指令的执行与发射管线占满导致warp等待
+// 在 GPU SM 中有一个专门处理 memory / shared memory / special math 指令的 pipeline：MIO pipeline（并不是它本身搬运数据）
+
 // data global mem -> shared memory
 // thread shared mem -> register
 // shared mem is in SM(stream multi-processor) same block shared mem 
@@ -48,7 +51,7 @@ __managed__ int c_cpu[M * K];
 
 #define BLOCK_SIZE 16
 
-__global__ void gpu_matmul1(int *a, int *b, int *c, int m, int n, int k)
+__global__ void gpu_matmul2(int *a, int *b, int *c, int m, int n, int k)
 {
     __shared__ int sub_a[BLOCK_SIZE][BLOCK_SIZE]; // 每个block内的所有线程都指向这同一块空间
     __shared__ int sub_b[BLOCK_SIZE][BLOCK_SIZE];
@@ -60,7 +63,7 @@ __global__ void gpu_matmul1(int *a, int *b, int *c, int m, int n, int k)
     int idx;
     for(int step=0; step<((n + BLOCK_SIZE - 1) / BLOCK_SIZE); step++) // 每个结果block对应多个A,B块，需要多次load（shared_mem大小有限）
     {
-        // load 子矩阵a
+        // load 子矩阵a，每个线程load相应位置
         // 计算子矩阵对应位置的线程号
         int idx_x = step * BLOCK_SIZE + threadIdx.x; // block内某个线程对应的位置的读数
         int idx_y = y;
@@ -102,7 +105,7 @@ __global__ void gpu_matmul1(int *a, int *b, int *c, int m, int n, int k)
     }
 }
 
-void cpu_matmul1(int *a, int *b, int *c, int m, int n, int k)
+void cpu_matmul(int *a, int *b, int *c, int m, int n, int k)
 {
     for(int y=0; y<m; ++y)
     {
@@ -144,8 +147,8 @@ int main()
     dim3 dimGrid(grid_x, grid_y);
     dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
 
-    gpu_matmul1<<<dimGrid, dimBlock>>>(a, b, c_gpu, M, N, K);
-    cpu_matmul1(a, b, c_cpu, M, N, K);
+    gpu_matmul2<<<dimGrid, dimBlock>>>(a, b, c_gpu, M, N, K);
+    cpu_matmul(a, b, c_cpu, M, N, K);
 
     bool errors = false;
     for(int y=0; y<M; ++y)
