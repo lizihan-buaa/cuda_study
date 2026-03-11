@@ -1,4 +1,5 @@
 # cuda_study
 1.matmul:
-    v0:Repeated memory access
-    v1:shared memory
+    v0:naive
+    v1:global_memory_coalescing
+    v2:shared memory

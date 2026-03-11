@@ -3,10 +3,18 @@
 #include <cuda_runtime.h>
 
 // 全局内存合并
-// 理解warp在其中的作用：
+// 理解warp在其中的作用:naive方法的warp访问的全局内存不连续
 // 属于同一warp的线程的顺序内存访问可以合并并作为一个整体执行。这被称为全局内存合并（GMEM）
 // 线程id计算方法：threadId = threadIdx.x+blockDim.x*(threadIdx.y+blockDim.y*threadIdx.z)
 // 注意这里不再区分线程在块内的维度，而是计算一个id，这个id用于做warp的划分
+// threadIdx.x 0 1 2 3 0 1 2 3 0 1 2 3 0 1 2 3
+// threadIdx.y 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3
+// threadIdx.z 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1
+// threadIdx   0 1 2 3 4 5 6 7 8 9 ...
+
+// 本方法和v0没有区别，原因是：
+// 对于A阵，连续的thread访问同一内存；
+// 对于B矩阵连续的thread之间访问连续的首地址，thread内带stride，这样的访存请求已是合并的
 
 #define M 1000
 #define N 500
@@ -18,9 +26,22 @@ __managed__ int b[N * K];
 __managed__ int c_gpu[M * K];
 __managed__ int c_cpu[M * K];
 
-void gpu_matmul1(int *a, int *b, int *c, int m, int n, int k)
+__global__ void gpu_matmul1(int *a, int *b, int *c, int m, int n, int k)
 {
-
+    int y = blockDim.y * blockIdx.y + threadIdx.y;
+    int x = blockDim.x * blockIdx.x + threadIdx.x;
+    // blockDim：Block 的维度（每个维度上的线程数)
+    // blockIdx：当前 Block 在 Grid 中的索引（从 0 开始）
+    // threadIdx：当前 Thread 在 Block 中的索引（从 0 开始）
+    int tmp = 0;
+    if(x < k && y < m) //否则出越界报错
+    {
+        for(int step=0; step<n; ++step) // 该方法存在重复访存的问题
+        {
+            tmp += a[y*n + step] * b[step * k + x];
+        }
+        c[y * k + x] = tmp;
+    }
 }
 
 void cpu_matmul(int *a, int *b, int *c, int m, int n, int k)
