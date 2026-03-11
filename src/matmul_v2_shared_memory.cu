@@ -61,6 +61,7 @@ __global__ void gpu_matmul2(int *a, int *b, int *c, int m, int n, int k)
 
     int tmp = 0;
     int idx;
+    //for(int blockIdx=0; blockIdx<n; blockIdx+=BLOCK_SIZE)
     for(int step=0; step<((n + BLOCK_SIZE - 1) / BLOCK_SIZE); step++) // 每个结果block对应多个A,B块，需要多次load（shared_mem大小有限）
     {
         // load 子矩阵a，每个线程load相应位置
