@@ -2,10 +2,10 @@
 #include <math.h>
 #include <cuda_runtime.h>
 
-// 单线程负责C中多结果（TM*TN），结合共享内存分块和寄存器分块
+// 单线程负责C中多结果（TM*TK），结合共享内存分块和寄存器分块
 // BM, BK, BK: Block 级别的分块尺寸。一个 Block 负责输出C矩阵中BM*BK的区域
-// TM, TN: Thread 级别的分块尺寸。一个 Thread 负责输出TM*TN的区域
-// numThreadsBlocktile: 每个 Block 里的线程数。由于每个线程算TM*TK个点，所以线程数 =(BM*BK) / (TM*TN)
+// TM, TK: Thread 级别的分块尺寸。一个 Thread 负责输出TM*TK的区域
+// numThreadsBlocktile: 每个 Block 里的线程数。由于每个线程算TM*TK个点，所以线程数 =(BM*BK) / (TM*TK)
 
 // 解决以下问题：
 // MIO访存指令的执行与发射管线占满导致warp等待（并未完全解决）
@@ -25,7 +25,7 @@
 #define BK 64
 #define BN 8
 #define TM 8
-#define TN 8
+#define TK 8
 
 __managed__ int a[M * N]; // 统一内存
 __managed__ int b[N * K];
@@ -43,11 +43,11 @@ __global__ void gpu_matmul3(int *a, int *b, int *c, int m, int n, int k)
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
     const int threadRow = threadIdx.y * TM;
-    const int threadCol = threadIdx.x * TN;
+    const int threadCol = threadIdx.x * TK;
 
-    int threadResults[TM * TN] = {0};
+    int threadResults[TM * TK] = {0};
     int regA[TM];
-    int regB[TN];
+    int regB[TK];
 
     int numThreads = blockDim.x * blockDim.y;
 
@@ -93,14 +93,14 @@ __global__ void gpu_matmul3(int *a, int *b, int *c, int m, int n, int k)
             for (int i = 0; i < TM; i++)
                 regA[i] = sub_a[threadRow + i][dotIdx];
 
-            for (int i = 0; i < TN; i++)
+            for (int i = 0; i < TK; i++)
                 regB[i] = sub_b[dotIdx][threadCol + i];
 
             for (int i = 0; i < TM; i++)
             {
-                for (int j = 0; j < TN; j++)
+                for (int j = 0; j < TK; j++)
                 {
-                    threadResults[i * TN + j] += regA[i] * regB[j];
+                    threadResults[i * TK + j] += regA[i] * regB[j];
                 }
             }
         }
@@ -111,18 +111,19 @@ __global__ void gpu_matmul3(int *a, int *b, int *c, int m, int n, int k)
     // ---- write back ----
     for (int i = 0; i < TM; i++)
     {
-        for (int j = 0; j < TN; j++)
+        for (int j = 0; j < TK; j++)
         {
             int g_r = cRow * BM + threadRow + i;
             int g_c = cCol * BK + threadCol + j;
 
             if (g_r < m && g_c < k)
             {
-                c[g_r * k + g_c] = threadResults[i * TN + j];
+                c[g_r * k + g_c] = threadResults[i * TK + j];
             }
         }
     }
 }
+
 
 void cpu_matmul(int *a, int *b, int *c, int m, int n, int k)
 {
@@ -160,7 +161,7 @@ int main()
         }
     }
 
-    dim3 dimBlock((BK / TN), (BM / TM)); // 线程数变少了，但每个线程变强了
+    dim3 dimBlock((BK / TK), (BM / TM)); // 线程数变少了，但每个线程变强了
     dim3 dimGrid((K + BK - 1) / BK, (M + BM - 1) / BM);
 
     gpu_matmul3<<<dimGrid, dimBlock>>>(a, b, c_gpu, M, N, K);
