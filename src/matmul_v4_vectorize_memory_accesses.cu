@@ -6,9 +6,9 @@
 // 这种优化的核心在于减少指令发射数量和提升内存带宽利用率
 // MIO访存指令的执行与发射管线占满导致warp等待（v3并未完全解决）
 
-#define M 1024
-#define N 512
-#define K 1024
+#define M 1000
+#define N 500
+#define K 1000
 // 每个block有64个线程
 // 每个线程负责C中64个对象
 #define BM 64
