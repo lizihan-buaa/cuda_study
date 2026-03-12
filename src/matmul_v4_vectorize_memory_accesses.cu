@@ -80,6 +80,7 @@ __global__ void gpu_matmul4(int *a, int *b, int *c, int m, int n, int k)
 
         // ---- 计算 (寄存器分块) ----
         #pragma unroll
+        // 告诉编译器,把这个循环拆开，直接把里面的代码重复写出来，不做循环判断
         for (int dotIdx = 0; dotIdx < BN; dotIdx++) {
             int regA[TM];
             int regB[TK];
