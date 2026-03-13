@@ -2,9 +2,11 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <cuda_fp16.h>
 
 using namespace nvcuda;
 
+// Tensor Core 对 FP16 的标准形状要求通常是 16x16x16
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
@@ -13,61 +15,64 @@ using namespace nvcuda;
 #define N_GLOBAL 512
 #define K_GLOBAL 1024
 
-__managed__ signed char a[M_GLOBAL * N_GLOBAL];
-__managed__ signed char b[N_GLOBAL * K_GLOBAL];
-__managed__ int c_gpu[M_GLOBAL * K_GLOBAL];
-__managed__ int c_cpu[M_GLOBAL * K_GLOBAL];
+// 使用 managed 内存简化数据传输
+__managed__ half a[M_GLOBAL * N_GLOBAL];
+__managed__ half b[N_GLOBAL * K_GLOBAL];
+__managed__ float c_gpu[M_GLOBAL * K_GLOBAL];
+__managed__ float c_cpu[M_GLOBAL * K_GLOBAL];
 
-__global__ void gpu_matmul6(const signed char *a, const signed char *b, int *c,
-                            int m, int n, int k)
+__global__ void gpu_matmul_fp16(const half *a, const half *b, float *c, int m, int n, int k)
 {
-    // 每个warp负责一个16x16 tile
+    // 每个 warp 负责一个 16x16 的 tile
     int warpId = threadIdx.x / 32;
 
     int warpM = (blockIdx.y * (blockDim.x / 32) + warpId) * WMMA_M;
     int warpN = blockIdx.x * WMMA_N;
 
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, signed char, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, signed char, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int> acc_frag;
+    // 声明 fragments: a, b 使用 half, accumulator 使用 float
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
 
-    wmma::fill_fragment(acc_frag, 0);
+    wmma::fill_fragment(acc_frag, 0.0f);
 
     for(int i = 0; i < n; i += WMMA_K)
     {
         if(warpM < m && warpN < k)
         {
-            const signed char *a_tile = a + warpM * n + i;
-            const signed char *b_tile = b + i * k + warpN;
+            const half *a_tile = a + warpM * n + i;
+            const half *b_tile = b + i * k + warpN;
 
+            // 加载矩阵
             wmma::load_matrix_sync(a_frag, a_tile, n);
             wmma::load_matrix_sync(b_frag, b_tile, k);
 
+            // 矩阵乘加
             wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
     }
 
     if(warpM < m && warpN < k)
     {
-        int *c_tile = c + warpM * k + warpN;
+        float *c_tile = c + warpM * k + warpN;
+        // 将结果存回内存
         wmma::store_matrix_sync(c_tile, acc_frag, k, wmma::mem_row_major);
     }
 }
 
-void cpu_matmul(const signed char *a, const signed char *b, int *c,
-                int m, int n, int k)
+// CPU 端用于验证的 FP16 矩阵乘法
+void cpu_matmul(const half *a, const half *b, float *c, int m, int n, int k)
 {
     for(int y = 0; y < m; y++)
     {
         for(int x = 0; x < k; x++)
         {
-            int tmp = 0;
-
+            float tmp = 0.0f;
             for(int step = 0; step < n; step++)
             {
-                tmp += a[y * n + step] * b[step * k + x];
+                // 将 half 转为 float 计算
+                tmp += __half2float(a[y * n + step]) * __half2float(b[step * k + x]);
             }
-
             c[y * k + x] = tmp;
         }
     }
@@ -75,48 +80,33 @@ void cpu_matmul(const signed char *a, const signed char *b, int *c,
 
 int main()
 {
-    // 初始化数据（避免 int8 溢出）
-    for(int y = 0; y < M_GLOBAL; y++)
-    {
-        for(int x = 0; x < N_GLOBAL; x++)
-        {
-            a[y * N_GLOBAL + x] = rand() % 16 - 8;
-        }
-    }
+    // 初始化数据
+    for(int i = 0; i < M_GLOBAL * N_GLOBAL; i++)
+        a[i] = __float2half((float)(rand() % 10) / 10.0f);
 
-    for(int y = 0; y < N_GLOBAL; y++)
-    {
-        for(int x = 0; x < K_GLOBAL; x++)
-        {
-            b[y * K_GLOBAL + x] = rand() % 16 - 8;
-        }
-    }
+    for(int i = 0; i < N_GLOBAL * K_GLOBAL; i++)
+        b[i] = __float2half((float)(rand() % 10) / 10.0f);
 
-    // 每个block 4 warp
-    dim3 dimBlock(128,1);
-
-    // 每个warp算一个16x16
+    // 每个 block 配置 4 个 warp (128 threads)
+    dim3 dimBlock(128, 1);
+    // 每个 block 处理 4 个 16x16 tile (纵向排列)
     dim3 dimGrid(K_GLOBAL / WMMA_N, (M_GLOBAL / WMMA_M) / 4);
 
-    gpu_matmul6<<<dimGrid, dimBlock>>>(a, b, c_gpu, M_GLOBAL, N_GLOBAL, K_GLOBAL);
+    gpu_matmul_fp16<<<dimGrid, dimBlock>>>(a, b, c_gpu, M_GLOBAL, N_GLOBAL, K_GLOBAL);
 
     cudaDeviceSynchronize();
 
+    // CPU 验证
     cpu_matmul(a, b, c_cpu, M_GLOBAL, N_GLOBAL, K_GLOBAL);
 
+    // 浮点数验证（使用较小的阈值，因为 half 存在精度损失）
     bool errors = false;
-
-    for(int y = 0; y < M_GLOBAL; y++)
+    for(int i = 0; i < M_GLOBAL * K_GLOBAL; i++)
     {
-        for(int x = 0; x < K_GLOBAL; x++)
+        if(abs(c_cpu[i] - c_gpu[i]) > 0.1f) 
         {
-            int idx = y * K_GLOBAL + x;
-
-            if(c_cpu[idx] != c_gpu[idx])
-            {
-                errors = true;
-                break;
-            }
+            errors = true;
+            break;
         }
     }
 
