@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 
 // 添加双缓冲机制，数据乒乓
+// 当线程执行到 Load 指令时，它把任务丢给 LS 管线就走开了；紧接着执行 Add/Mul 指令时，它把任务丢给 ALU 管线。从而实现了数据乒乓
+// 因此实现双缓冲机制并不需要增加线程数，只需要增加共享内存大小
 
 #define M 1000
 #define N 500
@@ -22,7 +24,7 @@ __managed__ int c_cpu[M * K];
 
 __global__ void gpu_matmul5(int *a, int *b, int *c, int m, int n, int k)
 {
-    // Shared Memory 布局：[2][行][列]
+    // Shared Memory 布局：[2][行][列] 1ping 1pong
     // BN 为 8，使用 int4 加载时，每行刚好是 2 个 int4
     __shared__ int sub_a[2][BM][BN]; 
     __shared__ int sub_b[2][BN][BK];
