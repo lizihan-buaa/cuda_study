@@ -37,8 +37,9 @@ __global__ void gpu_matmul_fp16(const half *a, const half *b, float *c, int m, i
 {
     // 1. 声明双缓冲 Shared Memory (2层 stage)
     // 增加一层维度 [2] 用于切换 buffer
-    __shared__ alignas(16) half sub_a[2][S_M][S_N]; // 内存对16对齐（首地址是16的整数倍），使得可以进行向量化访问（可能牺牲空间，换取时间性能提升）
-    __shared__ alignas(16) half sub_b[2][S_N][S_K]; // 16字节 = 128位 GPU 的单条访存指令最大就是 128 位（16 字节）
+    // padding +8 是为了避免bank冲突
+    __shared__ alignas(16) half sub_a[2][S_M][S_N + 8]; // 内存对16对齐（首地址是16的整数倍），使得可以进行向量化访问（可能牺牲空间，换取时间性能提升）
+    __shared__ alignas(16) half sub_b[2][S_N][S_K + 8]; // 16字节 = 128位 GPU 的单条访存指令最大就是 128 位（16 字节）
 
     int warpId = threadIdx.x / 32;
     int warpM = (warpId / 4) * WMMA_M; 
@@ -106,8 +107,8 @@ __global__ void gpu_matmul_fp16(const half *a, const half *b, float *c, int m, i
         // 3. 计算当前 stage 的数据 (Compute)
         for (int j = 0; j < S_N; j += WMMA_N)
         {
-            wmma::load_matrix_sync(a_frag, (half*)&sub_a[stage][warpM][j], S_N);
-            wmma::load_matrix_sync(b_frag, (half*)&sub_b[stage][j][warpK], S_K);
+            wmma::load_matrix_sync(a_frag, (half*)&sub_a[stage][warpM][j], S_N + 8); // warp读取16*16的tile，不padding存在bank冲突
+            wmma::load_matrix_sync(b_frag, (half*)&sub_b[stage][j][warpK], S_K + 8);
             wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
 
