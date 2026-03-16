@@ -7,3 +7,4 @@
     v4:vectorize_memory_accesses; padding_no_bank_conflict
     v5:double_buffering
     v6:use_tensor_core
+    v7:use_tensor_core; shared_memory
