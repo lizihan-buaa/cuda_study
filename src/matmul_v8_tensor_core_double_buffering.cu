@@ -37,7 +37,7 @@ __global__ void gpu_matmul_fp16(const half *a, const half *b, float *c, int m, i
 {
     // 1. 声明双缓冲 Shared Memory (2层 stage)
     // 增加一层维度 [2] 用于切换 buffer
-    __shared__ alignas(16) half sub_a[2][S_M][S_N];
+    __shared__ alignas(16) half sub_a[2][S_M][S_N]; // 内存对16对其（首地址是16的整数倍），使得可以进行向量化访问（可能牺牲空间，换取时间性能提升）
     __shared__ alignas(16) half sub_b[2][S_N][S_K];
 
     int warpId = threadIdx.x / 32;
@@ -53,22 +53,24 @@ __global__ void gpu_matmul_fp16(const half *a, const half *b, float *c, int m, i
 
     wmma::fill_fragment(acc_frag, 0.0f);
 
-    // 初始化管道
+    // 管理异步内存拷贝 (memcpy_async) 与 计算任务 (Tensor Core) 之间的先后顺序，从而实现“边搬运、边计算”
     auto pipe = cuda::make_pipeline();
 
     // --- 预加载第 0 块数据 ---
-    pipe.producer_acquire();
+    pipe.producer_acquire(); // 生产者阶段1：申请当前stage的空间
     for (int t = threadIdx.x; t < S_M * S_N; t += blockDim.x)
     {
-        int r = t / S_N; int c_idx = t % S_N;
-        cuda::memcpy_async(&sub_a[0][r][c_idx], &a[(blockM + r) * n + c_idx], sizeof(half), pipe);
+        int r = t / S_N;
+        int c_idx = t % S_N;
+        cuda::memcpy_async(&sub_a[0][r][c_idx], &a[(blockM + r) * n + c_idx], sizeof(half), pipe); // 生产者阶段2：派发异步搬运任务，绑定到该 pipe
     }
     for (int t = threadIdx.x; t < S_N * S_K; t += blockDim.x)
     {
-        int r = t / S_K; int c_idx = t % S_K;
+        int r = t / S_K;
+        int c_idx = t % S_K;
         cuda::memcpy_async(&sub_b[0][r][c_idx], &b[r * k + (blockK + c_idx)], sizeof(half), pipe);
     }
-    pipe.producer_commit();
+    pipe.producer_commit(); // 生产者阶段3：提交任务：告诉系统这批搬运已经进队列了
 
     // --- 主循环 ---
     int stage = 0;
@@ -84,20 +86,22 @@ __global__ void gpu_matmul_fp16(const half *a, const half *b, float *c, int m, i
             pipe.producer_acquire();
             for (int t = threadIdx.x; t < S_M * S_N; t += blockDim.x)
             {
-                int r = t / S_N; int c_idx = t % S_N;
+                int r = t / S_N;
+                int c_idx = t % S_N;
                 cuda::memcpy_async(&sub_a[next_stage][r][c_idx], &a[(blockM + r) * n + (next_i + c_idx)], sizeof(half), pipe);
             }
             for (int t = threadIdx.x; t < S_N * S_K; t += blockDim.x)
             {
-                int r = t / S_K; int c_idx = t % S_K;
+                int r = t / S_K;
+                int c_idx = t % S_K;
                 cuda::memcpy_async(&sub_b[next_stage][r][c_idx], &b[(next_i + r) * k + (blockK + c_idx)], sizeof(half), pipe);
             }
             pipe.producer_commit();
         }
 
         // 2. 等待当前 stage 的数据搬运完成
-        pipe.consumer_wait();
-        __syncthreads(); // 确保消费者能看到 smem 数据
+        pipe.consumer_wait(); // 消费者阶段1：挡住计算逻辑：确认当前 Stage 的数据搬完了吗？
+        __syncthreads();
 
         // 3. 计算当前 stage 的数据 (Compute)
         for (int j = 0; j < S_N; j += WMMA_N)
@@ -109,7 +113,7 @@ __global__ void gpu_matmul_fp16(const half *a, const half *b, float *c, int m, i
 
         // 4. 释放当前 stage 的空间
         __syncthreads();
-        pipe.consumer_release();
+        pipe.consumer_release(); // 消费者阶段2：释放空间，告诉系统这块内存可以给下一轮搬运用了
 
         // 切换 buffer 索引
         stage = next_stage;
