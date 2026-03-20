@@ -24,9 +24,9 @@ __global__ void gpu_transpose(int *in, int *out, int m, int n)
     __shared__ int sub[BLOCK_SIZE * (BLOCK_SIZE + 1)];
 
     // global_mem -> shared_mem
-    if(x < M && y < N)
+    if(x < m && y < n)
     {
-        sub[threadIdx.y * (BLOCK_SIZE + 1) + threadIdx.x] = in[y * M + x];
+        sub[threadIdx.y * (BLOCK_SIZE + 1) + threadIdx.x] = in[y * m + x];
     }
     __syncthreads();
 
@@ -34,9 +34,9 @@ __global__ void gpu_transpose(int *in, int *out, int m, int n)
     int x1 = threadIdx.x + blockDim.y * blockIdx.y;
     int y1 = threadIdx.y + blockDim.x * blockIdx.x;
 
-    if(x1 < N && y1 < M)
+    if(x1 < n && y1 < m)
     {
-        out[y1 * N + x1] = sub[threadIdx.x * (BLOCK_SIZE + 1) + threadIdx.y];
+        out[y1 * n + x1] = sub[threadIdx.x * (BLOCK_SIZE + 1) + threadIdx.y];
     }
 }
 void cpu_transpose(int *in, int *out, int m, int n)
