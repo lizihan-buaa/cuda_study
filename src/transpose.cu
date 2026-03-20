@@ -30,7 +30,9 @@ __global__ void gpu_transpose(int *in, int *out, int m, int n)
     }
     __syncthreads();
 
-    // 线程在block内坐标不变，block位置发生变化
+    // 计算全局中坐标变化情况(当前thread读和写的不是同一个数)
+    // block位置发生变化 即blockIdx变化
+    // ！！！但某个线程读的那个数b57，和写的那个数b48在block内位置都是（2，1）即threadIdx不变
     int x1 = threadIdx.x + blockDim.y * blockIdx.y;
     int y1 = threadIdx.y + blockDim.x * blockIdx.x;
 
