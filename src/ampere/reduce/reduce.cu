@@ -110,3 +110,44 @@ __global__ void reduce_v3(float* input, float* output, int n) {
         output[blockIdx.x] = smem[0];
     }
 }
+
+// Warp 内规约辅助函数
+__device__ float warpReduceSum(float val) {
+    // 每次将右半边的值加到左半边
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;  // lane 0 持有最终结果
+}
+
+// V6: Warp Shuffle + 两级规约
+__global__ void reduce_v6(float* input, float* output, int n) {
+    int tid  = threadIdx.x;
+    int gid  = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+    int lane = tid % 32;      // 线程在 Warp 内的编号（0~31）
+    int wid  = tid / 32;      // 该线程属于哪个 Warp
+
+    // 每线程处理 2 个元素
+    float val = 0.0f;
+    if (gid < n)              val += input[gid];
+    if (gid + blockDim.x < n) val += input[gid + blockDim.x];
+
+    // 第一级：Warp 内规约
+    val = warpReduceSum(val);
+
+    // 将每个 Warp 的结果（仅 lane 0 有效）存入 Shared Memory
+    __shared__ float warp_results[32];  // 最多 32 个 Warp（1024/32）
+    if (lane == 0) {
+        warp_results[wid] = val;
+    }
+    __syncthreads();
+
+    // 第二级：Warp 间规约（用 Warp 0 处理）
+    int num_warps = blockDim.x / 32;
+    if (wid == 0) {
+        val = (lane < num_warps) ? warp_results[lane] : 0.0f;
+        val = warpReduceSum(val);
+    }
+
+    if (tid == 0) output[blockIdx.x] = val;
+}
