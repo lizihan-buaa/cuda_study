@@ -54,3 +54,30 @@ __global__ void reduce_v1(float* input, float* output, int n) {
     }
 }
 // 前几轮完全消除分化，仅最后几轮（工作线程很少时）存在 Warp 内分化。
+
+// 第 1 轮（s=1）：tid 0 访问 smem[0]、smem[1]；tid 16 访问 smem[32]、smem[33]。smem[0] 和 smem[32] 都落在 Bank 0 → 2 路 Bank Conflict
+// 第 2 轮（s=2）：tid 0 访问 smem[0,2]；tid 8 访问 smem[32,34]；tid 16 访问 smem[64,66]；tid 24 访问 smem[96,98]。smem[0]、smem[32]、smem[64]、smem[96] 都在 Bank 0 → 4 路 Bank Conflict
+// 第 3 轮（s=4）：8 路 Bank Conflict
+
+// V2: 步长从大到小，同时消除 Warp Divergence 与 Bank Conflict
+__global__ void reduce_v2(float* input, float* output, int n) {
+    extern __shared__ float smem[];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    smem[tid] = (gid < n) ? input[gid] : 0.0f;
+    __syncthreads();
+
+    // 步长从 blockDim.x/2 开始，每轮减半
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[blockIdx.x] = smem[0];
+    }
+}
