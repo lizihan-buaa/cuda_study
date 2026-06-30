@@ -151,3 +151,66 @@ __global__ void reduce_v6(float* input, float* output, int n) {
 
     if (tid == 0) output[blockIdx.x] = val;
 }
+
+// V7: float4 向量化加载 + Grid Stride Loop + Warp Shuffle
+__global__ void reduce_v7(float* input, float* output, int n) {
+    int tid  = threadIdx.x;
+    int lane = tid % 32;
+    int wid  = tid / 32;
+
+    // float4 加载：每线程每次处理 4 个 float
+    float4* input4 = reinterpret_cast<float4*>(input);
+    int n4 = n / 4;  // float4 的元素数量
+
+    float val = 0.0f;
+
+    // Grid Stride Loop：每个线程以 gridDim.x * blockDim.x 为步长迭代
+    for (int idx = blockIdx.x * blockDim.x + tid;
+         idx < n4;
+         idx += gridDim.x * blockDim.x)
+    {
+        float4 data = input4[idx];
+        val += data.x + data.y + data.z + data.w;
+    }
+
+    // 处理 n 不是 4 的倍数时的尾部元素
+    int tail_start = n4 * 4;
+    for (int idx = tail_start + blockIdx.x * blockDim.x + tid;
+         idx < n;
+         idx += gridDim.x * blockDim.x)
+    {
+        val += input[idx];
+    }
+
+    // Warp 内规约
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+
+    __shared__ float warp_results[32];
+    if (lane == 0) warp_results[wid] = val;
+    __syncthreads();
+
+    int num_warps = blockDim.x / 32;
+    if (wid == 0) {
+        val = (lane < num_warps) ? warp_results[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+    }
+
+    if (tid == 0) output[blockIdx.x] = val;
+}
+// 固定 Grid 大小为 SM 数 × 4（最大化 GPU 利用率）
+// int num_sms;
+// cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+// int grid_size  = num_sms * 4;   // 432 for A100
+// int block_size = 256;
+// reduce_v7<<<grid_size, block_size>>>(d_input, d_partial, n);
+
+// 向量化加载（float4):GPU 的内存系统以事务（Transaction）为粒度传输数据，每次事务通常为 128 字节。
+// 每条 ld.global.v4.f32 指令的数据吞吐是 ld.global.f32 的 4 倍
+
+// Grid Stride Loop:固定 Grid 大小，让每个线程循环处理多段数据，直到覆盖整个数组。
+// Grid 大小可以设置为恰好填满 GPU，避免尾部 Block 浪费，固定 Grid 大小为 SM 数 × 4（最大化 GPU 利用率）
+// 每个线程处理更多数据，充分摊销 Kernel 启动和规约的固定开销
