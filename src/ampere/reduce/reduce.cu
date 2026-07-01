@@ -202,6 +202,9 @@ __global__ void reduce_v7(float* input, float* output, int n) {
     if (tid == 0) output[blockIdx.x] = val;
 }
 // 固定 Grid 大小为 SM 数 × 4（最大化 GPU 利用率）
+// 让 SM 上有足够多的 warp 来隐藏全局内存延迟；
+// 同时避免启动过多 Block，减少调度开销和 partial sum 数量
+
 // int num_sms;
 // cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
 // int grid_size  = num_sms * 4;   // 432 for A100
