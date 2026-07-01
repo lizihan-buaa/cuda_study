@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 #include <cuda_runtime.h>
 
 // V0: 朴素的树形规约（步长从小到大）
@@ -218,3 +220,191 @@ __global__ void reduce_v7(float* input, float* output, int n) {
 // Grid Stride Loop:固定 Grid 大小，让每个线程循环处理多段数据，直到覆盖整个数组。
 // Grid 大小可以设置为恰好填满 GPU，避免尾部 Block 浪费，固定 Grid 大小为 SM 数 × 4（最大化 GPU 利用率）
 // 每个线程处理更多数据，充分摊销 Kernel 启动和规约的固定开销
+
+#define CHECK_CUDA(call)                                                      \
+    do {                                                                      \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess) {                                              \
+            fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,     \
+                    cudaGetErrorString(err));                                  \
+            exit(EXIT_FAILURE);                                                \
+        }                                                                     \
+    } while (0)
+
+typedef void (*ReduceKernel)(float*, float*, int);
+
+struct BenchmarkConfig {
+    const char* name;
+    ReduceKernel kernel;
+    int elems_per_thread;
+    bool fixed_grid;
+};
+
+double cpu_reduce(const float* input, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += input[i];
+    }
+    return sum;
+}
+
+int div_up(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+void init_input(float* input, int n) {
+    for (int i = 0; i < n; ++i) {
+        input[i] = 1.0f;
+    }
+}
+
+double sum_partials(const float* partial, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += partial[i];
+    }
+    return sum;
+}
+
+void run_benchmark(const BenchmarkConfig& config,
+                   float* d_input,
+                   float* d_partial,
+                   float* h_partial,
+                   int n,
+                   int block_size,
+                   int num_sms,
+                   int warmup,
+                   int repeat,
+                   double cpu_ref) {
+    int grid_size = config.fixed_grid
+        ? num_sms * 4
+        : div_up(n, block_size * config.elems_per_thread);
+    size_t smem_bytes = config.fixed_grid ? 0 : block_size * sizeof(float);
+
+    for (int i = 0; i < warmup; ++i) {
+        config.kernel<<<grid_size, block_size, smem_bytes>>>(d_input, d_partial, n);
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+    for (int i = 0; i < repeat; ++i) {
+        config.kernel<<<grid_size, block_size, smem_bytes>>>(d_input, d_partial, n);
+    }
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaGetLastError());
+
+    float elapsed_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    double avg_ms = elapsed_ms / repeat;
+
+    CHECK_CUDA(cudaMemcpy(h_partial, d_partial, grid_size * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    double gpu_sum = sum_partials(h_partial, grid_size);
+    double abs_err = fabs(gpu_sum - cpu_ref);
+    double rel_err = abs_err / fmax(fabs(cpu_ref), 1.0);
+    double input_gb = (double)n * sizeof(float) / 1.0e9;
+    double effective_gbps = input_gb / (avg_ms / 1000.0);
+
+    printf("%-4s grid=%6d block=%4d avg_ms=%8.4f effective_read_GB/s=%9.2f "
+           "gpu_sum=%.0f cpu_sum=%.0f abs_err=%.6g rel_err=%.6g %s\n",
+           config.name, grid_size, block_size, avg_ms, effective_gbps,
+           gpu_sum, cpu_ref, abs_err, rel_err,
+           rel_err < 1e-5 ? "PASS" : "FAIL");
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+}
+
+bool should_run(const char* selected, const char* name) {
+    return strcmp(selected, "all") == 0 || strcmp(selected, name) == 0;
+}
+
+int main(int argc, char** argv) {
+    const char* selected = (argc > 1) ? argv[1] : "all";
+    int n = (argc > 2) ? atoi(argv[2]) : (1 << 26);
+    int repeat = (argc > 3) ? atoi(argv[3]) : 20;
+    int warmup = 5;
+    int block_size = 256;
+
+    if (n <= 0 || repeat <= 0) {
+        fprintf(stderr, "Usage: %s [all|v0|v1|v2|v3|v6|v7] [n] [repeat]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    int device = 0;
+    CHECK_CUDA(cudaGetDevice(&device));
+
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+
+    int num_sms = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
+
+    float* h_input = (float*)malloc((size_t)n * sizeof(float));
+    if (h_input == NULL) {
+        fprintf(stderr, "Failed to allocate host input\n");
+        return EXIT_FAILURE;
+    }
+    init_input(h_input, n);
+
+    double cpu_ref = cpu_reduce(h_input, n);
+
+    int max_grid = div_up(n, block_size);
+    int v7_grid = num_sms * 4;
+    int max_partial = max_grid > v7_grid ? max_grid : v7_grid;
+
+    float* h_partial = (float*)malloc((size_t)max_partial * sizeof(float));
+    if (h_partial == NULL) {
+        fprintf(stderr, "Failed to allocate host partial output\n");
+        free(h_input);
+        return EXIT_FAILURE;
+    }
+
+    float* d_input = NULL;
+    float* d_partial = NULL;
+    CHECK_CUDA(cudaMalloc(&d_input, (size_t)n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_partial, (size_t)max_partial * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_input, h_input, (size_t)n * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    BenchmarkConfig configs[] = {
+        {"v0", reduce_v0, 1, false},
+        {"v1", reduce_v1, 1, false},
+        {"v2", reduce_v2, 1, false},
+        {"v3", reduce_v3, 2, false},
+        {"v6", reduce_v6, 2, false},
+        {"v7", reduce_v7, 1, true},
+    };
+
+    printf("device=%d name=%s sms=%d n=%d repeat=%d cpu_sum=%.0f\n",
+           device, prop.name, num_sms, n, repeat, cpu_ref);
+
+    bool matched = false;
+    int num_configs = sizeof(configs) / sizeof(configs[0]);
+    for (int i = 0; i < num_configs; ++i) {
+        if (should_run(selected, configs[i].name)) {
+            matched = true;
+            run_benchmark(configs[i], d_input, d_partial, h_partial, n,
+                          block_size, num_sms, warmup, repeat, cpu_ref);
+        }
+    }
+
+    if (!matched) {
+        fprintf(stderr, "Unknown version: %s\n", selected);
+        fprintf(stderr, "Usage: %s [all|v0|v1|v2|v3|v6|v7] [n] [repeat]\n", argv[0]);
+    }
+
+    CHECK_CUDA(cudaFree(d_input));
+    CHECK_CUDA(cudaFree(d_partial));
+    free(h_input);
+    free(h_partial);
+
+    return matched ? EXIT_SUCCESS : EXIT_FAILURE;
+}
